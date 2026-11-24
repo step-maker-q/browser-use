@@ -607,6 +607,12 @@ def cmd_vod(args: argparse.Namespace) -> None:
             "--merge-output-format",
             "mp4",
         ]
+        # YouTube now uses JavaScript challenges; yt-dlp needs the EJS solver
+        # (which in turn needs Deno) to expose the combined mp4 formats.
+        if not getattr(args, "no_remote_components", False):
+            dl_cmd += ["--remote-components", "ejs:github"]
+        for extra in getattr(args, "yt_dlp_arg", []) or []:
+            dl_cmd.append(extra)
         cookies = getattr(args, "cookies", "") or ""
         browser = getattr(args, "cookies_from_browser", "") or ""
         if cookies:
@@ -620,7 +626,11 @@ def cmd_vod(args: argparse.Namespace) -> None:
             log(f"download failed: {exc}")
             raise SystemExit(
                 "YouTube download failed. Common fixes:\n"
-                "  - 'Sign in to confirm you're not a bot': add --cookies-from-browser chrome\n"
+                "  - 'Requested format is not available': install Deno (winget install DenoLand.Deno)\n"
+                "    and retry; the script now enables --remote-components ejs:github for you.\n"
+                "  - 'Sign in to confirm you're not a bot': export a cookies.txt and use --cookies\n"
+                "  - 'Could not copy Chrome cookie database': close the browser fully, or use\n"
+                "    --cookies /path/to/cookies.txt instead of --cookies-from-browser\n"
                 "  - 'Video unavailable' / members-only: add --cookies /path/to/cookies.txt\n"
                 "  - 'ffmpeg not found': pip install imageio-ffmpeg and export CLIP_FFMPEG\n"
                 "  - Or upload the video file to this workspace and use: vod /path/to/file.mp4"
@@ -857,6 +867,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--youtube-format", default="best[ext=mp4]/best", help="yt-dlp format selector")
     v.add_argument("--cookies", help="path to a local yt-dlp cookies.txt file")
     v.add_argument("--cookies-from-browser", help="e.g. chrome, firefox, edge (uses your logged-in browser session)")
+    v.add_argument("--no-remote-components", action="store_true", help="disable yt-dlp's EJS challenge solver download")
+    v.add_argument("--yt-dlp-arg", action="append", default=[], help="extra argument passed to yt-dlp (repeatable)")
     v.set_defaults(func=cmd_vod)
     return p
 
