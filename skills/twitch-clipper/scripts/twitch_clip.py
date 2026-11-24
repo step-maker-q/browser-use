@@ -232,6 +232,7 @@ class Clipper:
             self.source_url = normalize_youtube_url(initial_target)
         elif initial_target and self.platform == "twitch":
             self.source_url = f"https://www.twitch.tv/{initial_target.lstrip('/')}"
+        self._resolve_timing(args)
         self.out = Path(args.out).resolve()
         self.buffer = self.out / "buffer"
         self.clips = self.out / "clips"
@@ -240,6 +241,24 @@ class Clipper:
         self.clips.mkdir(parents=True, exist_ok=True)
         self.state: dict[str, Any] = self._load_state()
         self.last_fire = -1e9
+
+    @staticmethod
+    def _resolve_timing(args: argparse.Namespace) -> None:
+        """Social preset: ~30 s total with the highlight near the front (hook first)."""
+        preset = getattr(args, "preset", "social") or "social"
+        clip_seconds = getattr(args, "clip_seconds", None)
+        pre = getattr(args, "pre", None)
+        post = getattr(args, "post", None)
+        if clip_seconds:
+            pre = min(5.0, clip_seconds / 4)
+            post = clip_seconds - pre
+        else:
+            if pre is None:
+                pre = 5.0 if preset == "social" else 15.0
+            if post is None:
+                post = 25.0 if preset == "social" else 20.0
+        args.pre = float(pre)
+        args.post = float(post)
 
     def _load_state(self) -> dict[str, Any]:
         if self.state_path.exists():
@@ -337,6 +356,22 @@ class Clipper:
                 log(f"highlight detected at t={event_abs:.1f}s; clip will be cut after t={event['fire_at']:.1f}s")
             self._save_state()
 
+    def _video_args(self) -> list[str]:
+        aspect = getattr(self.args, "aspect", "vertical") or "vertical"
+        common = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"]
+        audio = ["-c:a", "aac", "-b:a", "160k"]
+        if aspect == "vertical":
+            # 9:16, 1080x1920, 30 fps. Blurred side bars keep the full gameplay
+            # frame visible instead of cropping off the HUD.
+            filter_complex = (
+                "[0:v]split=2[bg][fg];"
+                "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[b];"
+                "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[f];"
+                "[b][f]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[v]"
+            )
+            return ["-filter_complex", filter_complex, "-map", "[v]", "-map", "0:a:0?"] + common + audio
+        return ["-vf", "fps=30"] + common + audio
+
     def _cut_due_events(self) -> None:
         segs = self._segments()
         if not segs:
@@ -382,16 +417,7 @@ class Clipper:
                 f"{offset:.3f}",
                 "-t",
                 f"{duration:.3f}",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "22",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
+                *self._video_args(),
                 "-movflags",
                 "+faststart",
                 str(clip_path),
@@ -402,6 +428,9 @@ class Clipper:
                     "file": str(clip_path),
                     "platform": self.platform,
                     "source_url": self.source_url,
+                    "preset": getattr(self.args, "preset", "social"),
+                    "aspect": getattr(self.args, "aspect", "vertical"),
+                    "target_platforms": ["instagram_reels", "youtube_shorts"],
                     "event_at": event["at"],
                     "score": event["score"],
                     "reasons": event["reasons"],
@@ -642,10 +671,13 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--youtube-format", default="best[ext=mp4]/best", help="yt-dlp format selector for YouTube Live")
     w.add_argument("--cookies", help="path to a local yt-dlp cookies file for members-only/private streams")
     w.add_argument("--prefix", default="gta6", help="filename prefix for saved clips")
+    w.add_argument("--preset", choices=["social", "raw"], default="social", help="social = 30s vertical Reels/Shorts; raw = original aspect")
+    w.add_argument("--aspect", choices=["vertical", "original"], default="vertical", help="vertical = 1080x1920 with blurred side bars")
+    w.add_argument("--clip-seconds", type=float, help="total clip length; sets a short lead-in and the rest after the highlight")
     w.add_argument("--buffer-minutes", type=float, default=20.0)
     w.add_argument("--segment-seconds", type=int, default=30)
-    w.add_argument("--pre", type=float, default=15.0, help="seconds before the highlight")
-    w.add_argument("--post", type=float, default=20.0, help="seconds after the highlight")
+    w.add_argument("--pre", type=float, help="seconds before the highlight (default: 5 in social preset)")
+    w.add_argument("--post", type=float, help="seconds after the highlight (default: 25 in social preset)")
     w.add_argument("--threshold", type=float, default=0.65, help="0..1, lower = more clips")
     w.add_argument("--cooldown", type=float, default=90.0, help="minimum seconds between clips")
     w.set_defaults(func=lambda a: Clipper(a, find_bin("ffmpeg", a.ffmpeg) or "", find_bin("ffprobe", a.ffprobe, imageio_fallback=False), shutil.which("streamlink")).watch())
