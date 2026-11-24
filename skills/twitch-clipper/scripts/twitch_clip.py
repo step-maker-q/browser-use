@@ -7,6 +7,7 @@ The script never bypasses authentication, ads, or geo restrictions.
 Subcommands:
   doctor     check ffmpeg/streamlink/yt-dlp availability
   watch      record a rolling buffer from Twitch or YouTube Live and auto-cut MP4s
+  vod        download/analyze a finished YouTube video (or local file) and cut its best moments
   analyze    print the highlight score for a local media file
   selftest   generate a synthetic clip and verify analyze + cut end to end
 """
@@ -185,10 +186,15 @@ def analyze_file(path: Path, ffmpeg: str) -> Metrics:
     return metrics
 
 
-def score_metrics(m: Metrics) -> tuple[float, dict[str, float]]:
-    """Heuristic highlight score in [0, 1] with the reasons behind it."""
-    spike = m.p95_rms - m.median_rms  # dB above a rolling baseline
-    peak = m.peak_rms - m.median_rms
+def score_metrics(m: Metrics, baseline: float | None = None) -> tuple[float, dict[str, float]]:
+    """Heuristic highlight score in [0, 1] with the reasons behind it.
+
+    For a finite video, pass the whole-video median as `baseline` so that a
+    loud *segment* is detected even when its own internal RMS is flat.
+    """
+    base = m.median_rms if baseline is None else baseline
+    spike = m.p95_rms - base  # dB above the baseline
+    peak = m.peak_rms - base
     minutes = max(m.duration, 1.0) / 60.0
     scene_rate = len(m.scene_times) / minutes
 
@@ -373,10 +379,15 @@ class Clipper:
         return ["-vf", "fps=30"] + common + audio
 
     def _cut_due_events(self) -> None:
+        max_clips = getattr(self.args, "max_clips", 10**9)
+        if len(self.state["clips"]) >= max_clips:
+            return
         segs = self._segments()
         if not segs:
             return
-        now = segs[-1].end
+        # In VOD mode the whole file is already available; no need to wait for
+        # "future" footage to be recorded.
+        now = float("inf") if getattr(self.args, "vod", False) else segs[-1].end
         for event in self.state["events"]:
             if event.get("cut") or now + 0.5 < event["fire_at"]:
                 continue
@@ -397,7 +408,7 @@ class Clipper:
                 continue
             stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(event["observed_at"]))
             prefix = getattr(self.args, "prefix", "gta6") or "clip"
-            name = f"{prefix}-{stamp}-{int(event['score'] * 100):03d}.mp4"
+            name = f"{prefix}-{stamp}-{int(event['at']):05d}-{int(event['score'] * 100):03d}.mp4"
             clip_path = self.clips / name
             list_path = self.out / f"concat-{event['segment_index']}.txt"
             list_path.write_text("".join(f"file '{Path(s.path).as_posix()}'\n" for s in covering))
@@ -568,6 +579,141 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     print(json.dumps({"duration": m.duration, "score": round(score, 3), "loudest_at": round(m.loudest_time, 3), **reasons}, indent=2))
 
 
+def cmd_vod(args: argparse.Namespace) -> None:
+    ffmpeg = find_bin("ffmpeg", args.ffmpeg)
+    if not ffmpeg:
+        raise SystemExit("ffmpeg is missing; run the doctor subcommand")
+    os.environ["CLIP_FFMPEG"] = ffmpeg
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
+    source_arg = args.source.strip()
+    args.vod = True
+    looks_remote = source_arg.startswith(("http://", "https://", "www.", "youtube:", "yt:")) or (
+        "youtube.com" in source_arg or "youtu.be" in source_arg
+    )
+    if looks_remote:
+        downloader = shutil.which("yt-dlp")
+        if not downloader:
+            raise SystemExit("yt-dlp is not installed; run the doctor subcommand")
+        args.url = normalize_youtube_url(source_arg)
+        args.channel = ""
+        args.platform = "youtube"
+        log(f"downloading {args.url}")
+        run(
+            [
+                downloader,
+                "-f",
+                "best[ext=mp4]/best",
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                str(out / "source.%(ext)s"),
+                args.url,
+            ]
+        )
+        candidates = sorted(out.glob("source.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise SystemExit("yt-dlp finished but no source file was found")
+        source = candidates[0]
+    else:
+        args.url = ""
+        args.channel = ""
+        args.platform = "local"
+        source = Path(source_arg).expanduser().resolve()
+        if not source.exists():
+            raise SystemExit(f"source file not found: {source}")
+
+    log(f"analyzing {source} for highlights")
+    clipper = Clipper(
+        args,
+        ffmpeg,
+        find_bin("ffprobe", args.ffprobe, imageio_fallback=False),
+        shutil.which("streamlink"),
+    )
+    clipper.source_url = args.url or str(source)
+    clipper.state = {"segments": [], "events": [], "clips": []}
+    for stale in clipper.buffer.glob("seg_*.ts"):
+        stale.unlink()
+    run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(args.segment_seconds),
+            "-segment_start_number",
+            "0",
+            "-reset_timestamps",
+            "1",
+            "-segment_format",
+            "mpegts",
+            str(clipper.buffer / "seg_%06d.ts"),
+        ]
+    )
+    clipper._add_new_segments()
+    segs = clipper._segments()
+    if not segs:
+        raise SystemExit("no segments were produced from the source")
+    measured: list[tuple[Segment, Metrics]] = []
+    for seg in segs:
+        path = Path(seg.path)
+        if not path.exists():
+            continue
+        metrics = analyze_file(path, ffmpeg)
+        measured.append((seg, metrics))
+        log(
+            f"segment {seg.index:06d} rms={metrics.median_rms:.1f}dB "
+            f"scenes={len(metrics.scene_times)} @ {seg.start:.0f}s"
+        )
+    if not measured:
+        raise SystemExit("no readable segments found")
+    global_baseline = statistics.median(m.median_rms for _, m in measured)
+    log(f"whole-video audio baseline: {global_baseline:.1f} dB")
+    now_wall = time.time()
+    for seg, metrics in measured:
+        score, reasons = score_metrics(metrics, baseline=global_baseline)
+        event_at = seg.start + metrics.loudest_time
+        clipper.state.setdefault("analyzed", []).append(
+            {"segment_index": seg.index, "score": round(score, 3), "reasons": reasons}
+        )
+        if score < args.threshold:
+            continue
+        clipper.state["events"].append(
+            {
+                "segment_index": seg.index,
+                "at": round(event_at, 3),
+                "local_time": round(metrics.loudest_time, 3),
+                "score": round(score, 3),
+                "reasons": reasons,
+                "fire_at": round(event_at + args.post, 3),
+                "cut": False,
+                "observed_at": now_wall,
+            }
+        )
+    # Rank by score, then keep only the best non-overlapping events.
+    clipper.state["events"].sort(key=lambda e: e["score"], reverse=True)
+    kept: list[dict[str, Any]] = []
+    for event in clipper.state["events"]:
+        if any(abs(event["at"] - other["at"]) < args.cooldown for other in kept):
+            continue
+        kept.append(event)
+        if len(kept) >= args.max_clips:
+            break
+    clipper.state["events"] = kept
+    clipper._save_state()
+    clipper._cut_due_events()
+    log(f"done: {len(clipper.state['clips'])} clips in {clipper.clips}")
+
+
 def cmd_selftest(args: argparse.Namespace) -> None:
     ffmpeg = find_bin("ffmpeg", args.ffmpeg)
     if not ffmpeg:
@@ -681,6 +827,21 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--threshold", type=float, default=0.65, help="0..1, lower = more clips")
     w.add_argument("--cooldown", type=float, default=90.0, help="minimum seconds between clips")
     w.set_defaults(func=lambda a: Clipper(a, find_bin("ffmpeg", a.ffmpeg) or "", find_bin("ffprobe", a.ffprobe, imageio_fallback=False), shutil.which("streamlink")).watch())
+
+    v = sub.add_parser("vod", help="cut highlights from a finished YouTube video or a local file")
+    v.add_argument("source", help="YouTube URL/video ID or a local media file")
+    v.add_argument("--out", default="clips-output", help="directory for buffer/, clips/, state.json")
+    v.add_argument("--preset", choices=["social", "raw"], default="social")
+    v.add_argument("--aspect", choices=["vertical", "original"], default="vertical")
+    v.add_argument("--clip-seconds", type=float)
+    v.add_argument("--pre", type=float)
+    v.add_argument("--post", type=float)
+    v.add_argument("--threshold", type=float, default=0.75, help="0..1, higher = only the biggest moments")
+    v.add_argument("--cooldown", type=float, default=90.0)
+    v.add_argument("--max-clips", type=int, default=10)
+    v.add_argument("--segment-seconds", type=int, default=30)
+    v.add_argument("--prefix", default="gta6")
+    v.set_defaults(func=cmd_vod)
     return p
 
 

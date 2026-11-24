@@ -1,6 +1,6 @@
 ---
 name: twitch-clipper
-description: "Automatically clip highlights from Twitch or YouTube live streams (e.g. GTA VI gameplay) into vertical 9:16 MP4s ready for Instagram Reels and YouTube Shorts. Use when the user wants a rolling buffer of a live stream, automatic highlight detection, and short social-ready clips."
+description: "Automatically clip highlights from Twitch live streams, YouTube Live, or finished YouTube videos into vertical 9:16 MP4s ready for Instagram Reels and YouTube Shorts. Use when the user wants automatic highlight detection and short social-ready clips from a stream or video."
 ---
 
 # Live Stream Clipper (Twitch + YouTube → Reels/Shorts)
@@ -85,7 +85,27 @@ python3 skills/twitch-clipper/scripts/twitch_clip.py watch \
 
 `--url` also accepts a bare video ID (`VIDEO_ID`), `youtube:VIDEO_ID`, or a `youtu.be/...` link. `--platform` defaults to `auto`.
 
-Press Ctrl-C to stop. Outputs:
+## Quick Start — Finished YouTube Video (VOD)
+
+If the YouTube link is a normal uploaded video rather than a live stream, use `vod` instead of `watch`. It downloads the video, scores the whole file against a global audio baseline, keeps the best non-overlapping moments, and renders the same vertical 30 s MP4s:
+
+```bash
+python3 skills/twitch-clipper/scripts/twitch_clip.py vod \
+  'https://www.youtube.com/watch?v=VIDEO_ID' \
+  --out clips-youtube \
+  --max-clips 10 \
+  --threshold 0.75
+```
+
+A local file works too:
+
+```bash
+python3 skills/twitch-clipper/scripts/twitch_clip.py vod /path/to/video.mp4 --out clips-youtube
+```
+
+`--max-clips` (default 10) caps how many clips are rendered; raise `--threshold` for fewer/bigger moments or lower it to `0.6` for more.
+
+Press Ctrl-C to stop a `watch` session. Outputs:
 
 ```
 gta6-clips/
