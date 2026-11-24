@@ -105,6 +105,8 @@ python3 skills/twitch-clipper/scripts/twitch_clip.py vod /path/to/video.mp4 --ou
 
 `--max-clips` (default 10) caps how many clips are rendered; raise `--threshold` for fewer/bigger moments or lower it to `0.6` for more.
 
+If the download fails with **"Sign in to confirm you're not a bot"**, add `--cookies-from-browser chrome` (or `firefox` / `edge`). For **"Video unavailable"** or members-only videos, export a `cookies.txt` from your logged-in browser and add `--cookies /path/to/cookies.txt`. Never paste cookie contents into chat.
+
 Press Ctrl-C to stop a `watch` session. Outputs:
 
 ```

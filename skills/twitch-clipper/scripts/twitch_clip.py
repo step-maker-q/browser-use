@@ -600,18 +600,31 @@ def cmd_vod(args: argparse.Namespace) -> None:
         args.channel = ""
         args.platform = "youtube"
         log(f"downloading {args.url}")
-        run(
-            [
-                downloader,
-                "-f",
-                "best[ext=mp4]/best",
-                "--merge-output-format",
-                "mp4",
-                "-o",
-                str(out / "source.%(ext)s"),
-                args.url,
-            ]
-        )
+        dl_cmd = [
+            downloader,
+            "-f",
+            getattr(args, "youtube_format", "best[ext=mp4]/best"),
+            "--merge-output-format",
+            "mp4",
+        ]
+        cookies = getattr(args, "cookies", "") or ""
+        browser = getattr(args, "cookies_from_browser", "") or ""
+        if cookies:
+            dl_cmd.append(f"--cookies={cookies}")
+        elif browser:
+            dl_cmd.append(f"--cookies-from-browser={browser}")
+        dl_cmd += ["-o", str(out / "source.%(ext)s"), args.url]
+        try:
+            run(dl_cmd)
+        except RuntimeError as exc:
+            log(f"download failed: {exc}")
+            raise SystemExit(
+                "YouTube download failed. Common fixes:\n"
+                "  - 'Sign in to confirm you're not a bot': add --cookies-from-browser chrome\n"
+                "  - 'Video unavailable' / members-only: add --cookies /path/to/cookies.txt\n"
+                "  - 'ffmpeg not found': pip install imageio-ffmpeg and export CLIP_FFMPEG\n"
+                "  - Or upload the video file to this workspace and use: vod /path/to/file.mp4"
+            )
         candidates = sorted(out.glob("source.*"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not candidates:
             raise SystemExit("yt-dlp finished but no source file was found")
@@ -841,6 +854,9 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--max-clips", type=int, default=10)
     v.add_argument("--segment-seconds", type=int, default=30)
     v.add_argument("--prefix", default="gta6")
+    v.add_argument("--youtube-format", default="best[ext=mp4]/best", help="yt-dlp format selector")
+    v.add_argument("--cookies", help="path to a local yt-dlp cookies.txt file")
+    v.add_argument("--cookies-from-browser", help="e.g. chrome, firefox, edge (uses your logged-in browser session)")
     v.set_defaults(func=cmd_vod)
     return p
 
